@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"time"
 
 	"github.com/rcrowley/go-metrics"
@@ -53,6 +54,27 @@ func newDwarfPoolProcessor(cfg *ProcessorConfig, log *zap.Logger, deal *types.De
 	}
 }
 
+func newNanoPoolProcessor(cfg *ProcessorConfig, log *zap.Logger, deal *types.Deal, taskID string) *commonPoolProcessor {
+	workerID := fmt.Sprintf("x%s", deal.GetId().Unwrap().String())
+	l := log.Named("nanopool").With(
+		zap.String("deal_id", deal.GetId().Unwrap().String()),
+		zap.String("task_id", taskID),
+		zap.String("worker_id", workerID))
+
+	return &commonPoolProcessor{
+		log:             l,
+		cfg:             cfg,
+		taskID:          taskID,
+		workerID:        workerID,
+		startTime:       time.Now(),
+		deal:            deal,
+		hashrateEWMA:    metrics.NewEWMA(1 - math.Exp(-5.0/cfg.DecayTime)),
+		currentHashrate: atomic.NewFloat64(float64(deal.BenchmarkValue())),
+		hashrateQueue:   &lane.Queue{Deque: lane.NewCappedDeque(60)},
+		update:          nanoPoolUpdateFunc,
+	}
+}
+
 func (m *commonPoolProcessor) Run(ctx context.Context) error {
 	m.hashrateEWMA.Update(int64(m.currentHashrate.Load() * 5.))
 	m.hashrateEWMA.Tick()
@@ -93,8 +115,9 @@ func (m *commonPoolProcessor) Run(ctx context.Context) error {
 			}
 
 			m.log.Debug("received new hashrate", zap.Float64("value", v))
-			m.currentHashrate.Store(v)
-			m.updateHashRateQueue(v)
+			// WARN: don't forget to uncomment
+			// m.currentHashrate.Store(v)
+			// m.updateHashRateQueue(v)
 		}
 	}
 }
@@ -176,4 +199,55 @@ func dwarfPoolUpdateFunc(ctx context.Context, url string, workerID string) (floa
 	}
 
 	return rate * 1e6, nil
+}
+
+type nanoPoolWorker struct {
+	ID       string `json:"id"`
+	Hashrate string `json:"hashrate"`
+	H1       string `json:"h1"`
+	H3       string `json:"h3"`
+	H6       string `json:"h6"`
+	H12      string `json:"h12"`
+	H24      string `json:"h24"`
+}
+
+type nanoPoolResponse struct {
+	Data struct {
+		Workers []*nanoPoolWorker `json:"workers"`
+	} `json:"data"`
+}
+
+func nanoPoolUpdateFunc(ctx context.Context, url string, workerID string) (float64, error) {
+	data, err := price.FetchURLWithRetry(url)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch nanopool data: %v", err)
+	}
+
+	resp := &nanoPoolResponse{}
+	if err := json.Unmarshal(data, resp); err != nil {
+		return 0, fmt.Errorf("failed to parse nanopool response: %v", err)
+	}
+
+	found := true
+	var workerData *nanoPoolWorker
+	for _, w := range resp.Data.Workers {
+		if w.ID == workerID {
+			found = true
+			workerData = w
+			break
+		}
+	}
+
+	if !found {
+		return 0, fmt.Errorf("cannot find worker %s in reponse data", workerID)
+	}
+
+	z, _ := zap.NewDevelopment()
+	z.Debug("full hashrate response from nanopool", zap.Any("response", *workerData))
+	rate, err := strconv.ParseFloat(workerData.H1, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse hashrate: %v", err)
+	}
+
+	return rate, nil
 }

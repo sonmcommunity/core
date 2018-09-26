@@ -12,6 +12,7 @@ const (
 	LogFormatClaymore       = "claymore"
 	LogFormatXMRing         = "xmrig"
 	PoolFormatDwarf         = "dwarf"
+	PoolFormatNano          = "nano"
 	ProcessorFormatDisabled = "disabled"
 )
 
@@ -49,6 +50,11 @@ func NewProcessorFactory(cfg *Config) ProcessorFactory {
 		pool = func(deal *types.Deal, taskID string, opts ...Option) Processor {
 			o := makeOpts(opts...)
 			return newDwarfPoolProcessor(&cfg.PoolProcessorConfig, o.logger, deal, taskID)
+		}
+	case PoolFormatNano:
+		pool = func(deal *types.Deal, taskID string, opts ...Option) Processor {
+			o := makeOpts(opts...)
+			return newNanoPoolProcessor(&cfg.PoolProcessorConfig, o.logger, deal, taskID)
 		}
 	case ProcessorFormatDisabled:
 		pool = func(deal *types.Deal, taskID string, opts ...Option) Processor {
