@@ -103,7 +103,7 @@ func (m *chanListener) Close() error {
 	return m.listener.Close()
 }
 
-type natPuncherCTCP struct {
+type natPuncherTCPBase struct {
 	// Protocol describes the application layer protocol, like "grpc" or "ssh".
 	// This will be passed in the "protocol" frame to the Rendezvous server,
 	// resulting in something like "tcp+ssh" summary protocol.
@@ -128,11 +128,7 @@ type natPuncherCTCP struct {
 	log *zap.SugaredLogger
 }
 
-// NewNATPuncherClientTCP constructs a new client-side NAT puncher over TCP.
-//
-// The newly created puncher MUST be used exactly ONCE by calling "DialContext"
-// and should be closed using "Close" method after getting the result.
-func newNATPuncherClientTCP(rendezvousClient *rendezvousClient, protocol string, log *zap.SugaredLogger) (*natPuncherCTCP, error) {
+func newNatPuncherTCPBase(rendezvousClient *rendezvousClient, protocol string, log *zap.SugaredLogger) (*natPuncherTCPBase, error) {
 	if len(protocol) == 0 {
 		return nil, fmt.Errorf("empty protocol is not allowed")
 	}
@@ -146,13 +142,58 @@ func newNATPuncherClientTCP(rendezvousClient *rendezvousClient, protocol string,
 
 	connectionTxRx := make(chan connResult, 64)
 
-	m := &natPuncherCTCP{
+	m := &natPuncherTCPBase{
 		protocol:              protocol,
 		listener:              newChanListener(&xnet.BackPressureListener{Listener: listener, Log: log.Desugar()}, connectionTxRx),
 		rendezvousClient:      rendezvousClient,
 		passiveConnectionTxRx: connectionTxRx,
 		maxPunchAttempts:      3,
 		log:                   log,
+	}
+
+	return m, nil
+}
+
+// PunchAddr tries to establish a TCP connection to the specified address,
+// blocking until either the connection is established or an error occurs.
+//
+// When the specified context is canceled this method unblocks.
+func (m *natPuncherTCPBase) punchAddr(ctx context.Context, addr *sonm.Addr) (net.Conn, error) {
+	remoteAddr, err := addr.IntoTCP()
+	if err != nil {
+		return nil, err
+	}
+
+	errs := multierror.NewMultiError()
+	for i := 0; i < m.maxPunchAttempts; i++ {
+		conn, err := DialContext(ctx, protocol, m.rendezvousClient.LocalAddr().String(), remoteAddr.String())
+		if err != nil {
+			errs = multierror.AppendUnique(errs, err)
+			continue
+		}
+
+		return conn, nil
+	}
+
+	return nil, errs.ErrorOrNil()
+}
+
+type natPuncherCTCP struct {
+	*natPuncherTCPBase
+}
+
+// NewNATPuncherClientTCP constructs a new client-side NAT puncher over TCP.
+//
+// The newly created puncher MUST be used exactly ONCE by calling "DialContext"
+// and should be closed using "Close" method after getting the result.
+func newNATPuncherClientTCP(rendezvousClient *rendezvousClient, protocol string, log *zap.SugaredLogger) (*natPuncherCTCP, error) {
+	base, err := newNatPuncherTCPBase(rendezvousClient, protocol, log)
+	if err != nil {
+		return nil, err
+	}
+
+	m := &natPuncherCTCP{
+		natPuncherTCPBase: base,
 	}
 
 	return m, nil
@@ -260,30 +301,6 @@ func (m *natPuncherCTCP) doPunch(ctx context.Context, addrs []*sonm.Addr, readin
 	}
 }
 
-// PunchAddr tries to establish a TCP connection to the specified address,
-// blocking until either the connection is established or an error occurs.
-//
-// When the specified context is canceled this method unblocks.
-func (m *natPuncherCTCP) punchAddr(ctx context.Context, addr *sonm.Addr) (net.Conn, error) {
-	remoteAddr, err := addr.IntoTCP()
-	if err != nil {
-		return nil, err
-	}
-
-	var errs = multierror.NewMultiError()
-	for i := 0; i < m.maxPunchAttempts; i++ {
-		conn, err := DialContext(ctx, protocol, m.rendezvousClient.LocalAddr().String(), remoteAddr.String())
-		if err != nil {
-			errs = multierror.AppendUnique(errs, err)
-			continue
-		}
-
-		return conn, nil
-	}
-
-	return nil, errs.ErrorOrNil()
-}
-
 func (m *natPuncherCTCP) resolve(ctx context.Context, addr common.Address) (*sonm.RendezvousReply, error) {
 	privateAddrs, err := m.listener.PrivateAddrs()
 	if err != nil {
@@ -320,20 +337,7 @@ func (m *natPuncherCTCP) Close() error {
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 type natPuncherSTCP struct {
-	// Protocol describes the application layer protocol, like "grpc" or "ssh".
-	// This will be passed in the "protocol" frame to the Rendezvous server,
-	// resulting in something like "tcp+ssh" summary protocol.
-	protocol string
-	// Listener is the accepting side of the NPP protocol.
-	// It is required since the simultaneous TCP connection establishment gives
-	// unpredictable results on different platforms, meaning that it is unknown
-	// whether the connection arrives to the dialing socket or to the listening
-	// one.
-	listener *chanListener
-	// RendezvousClient is a client to the Rendezvous server.
-	// It is managed by this puncher and is closed during executing "Close"
-	// method.
-	rendezvousClient *rendezvousClient
+	*natPuncherTCPBase
 	// ReadinessTxRx is a channel that performs congestion control for server's
 	// announcement.
 	readinessTxRx chan struct{}
@@ -343,19 +347,11 @@ type natPuncherSTCP struct {
 	// ActiveConnectionTxRx is a channel where all actively obtained connection
 	// results (i.e. from punching) will be placed.
 	activeConnectionTxRx chan connResult
-	// PassiveConnectionTxRx is a channel where all passively obtained
-	// connection results (i.e. from the local Listener) will be placed.
-	passiveConnectionTxRx <-chan connResult
 	// CancelFunc is used to cancel internal event loop of this puncher.
 	cancelFunc context.CancelFunc
-	// MaxPunchAttempts shows how many attempts should we made to penetrate the
-	// NAT in case of failed connection attempt.
-	maxPunchAttempts int
-	// Log is a logger used by the puncher for internal logging, mostly debug.
-	log *zap.SugaredLogger
 }
 
-// todo: docs.
+// NewNATPuncherServerTCP constructs a new server-side TCP NAT puncher.
 //
 // The created puncher takes ownership over the specified Rendezvous client
 // parameter. However, the puncher must be closed using "Close" method.
@@ -363,13 +359,7 @@ type natPuncherSTCP struct {
 // Note, that passing empty "protocol" parameter is forbidden and results in
 // error.
 func newNATPuncherServerTCP(rendezvousClient *rendezvousClient, protocol string, log *zap.SugaredLogger) (*natPuncherSTCP, error) {
-	if len(protocol) == 0 {
-		return nil, fmt.Errorf("empty protocol is not allowed")
-	}
-
-	// It's important here to reuse the Rendezvous client local address for
-	// successful NAT penetration in the case of cone NAT.
-	listener, err := reuseport.Listen("tcp", rendezvousClient.LocalAddr().String())
+	base, err := newNatPuncherTCPBase(rendezvousClient, protocol, log)
 	if err != nil {
 		return nil, err
 	}
@@ -381,21 +371,15 @@ func newNATPuncherServerTCP(rendezvousClient *rendezvousClient, protocol string,
 	}
 
 	activeConnectionTxRx := make(chan connResult, 64)
-	passiveConnectionTxRx := make(chan connResult, 64)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	m := &natPuncherSTCP{
-		protocol:              protocol,
-		listener:              newChanListener(&xnet.BackPressureListener{Listener: listener, Log: log.Desugar()}, passiveConnectionTxRx),
-		rendezvousClient:      rendezvousClient,
-		readinessTxRx:         readinessTxRx,
-		numPunchesInProgress:  atomic.NewUint32(0),
-		activeConnectionTxRx:  activeConnectionTxRx,
-		passiveConnectionTxRx: passiveConnectionTxRx,
-		cancelFunc:            cancel,
-		maxPunchAttempts:      3,
-		log:                   log,
+		natPuncherTCPBase:    base,
+		readinessTxRx:        readinessTxRx,
+		numPunchesInProgress: atomic.NewUint32(0),
+		activeConnectionTxRx: activeConnectionTxRx,
+		cancelFunc:           cancel,
 	}
 
 	go m.run(ctx)
@@ -445,9 +429,8 @@ func (m *natPuncherSTCP) run(ctx context.Context) {
 			publishResponse, err := m.publish(ctx)
 			if err != nil {
 				m.log.Warnw("failed to publish itself on the rendezvous", zap.Error(err))
-				//return newRendezvousError(err)
-				// todo: it is better to recreate puncher after this error.
-				continue
+				m.activeConnectionTxRx <- newConnResultErr(newRendezvousError(err))
+				return
 			}
 
 			m.numPunchesInProgress.Inc()
@@ -474,7 +457,6 @@ func (m *natPuncherSTCP) publish(ctx context.Context) (*sonm.RendezvousReply, er
 	return m.rendezvousClient.Publish(ctx, request)
 }
 
-// todo: docs.
 func (m *natPuncherSTCP) punch(ctx context.Context, addrs []*sonm.Addr) {
 	defer func() { m.numPunchesInProgress.Dec(); m.readinessTxRx <- struct{}{} }()
 
@@ -490,7 +472,6 @@ func (m *natPuncherSTCP) punch(ctx context.Context, addrs []*sonm.Addr) {
 	}
 }
 
-// todo: docs.
 func (m *natPuncherSTCP) doPunch(ctx context.Context, addrs []*sonm.Addr, readinessChannel chan<- error, watcher connectionWatcher) {
 	m.log.Debugf("punching %d endpoint(s): %s", len(addrs), sonm.FormatAddrs(addrs...))
 
@@ -552,30 +533,6 @@ func (m *natPuncherSTCP) doPunch(ctx context.Context, addrs []*sonm.Addr, readin
 	if peer == nil {
 		readinessChannel <- fmt.Errorf("failed to punch the network using NPP: all attempts has failed - %s", errs.Error())
 	}
-}
-
-// PunchAddr tries to establish a TCP connection to the specified address,
-// blocking until either the connection is established or an error occurs.
-//
-// When the specified context is canceled this method unblocks.
-func (m *natPuncherSTCP) punchAddr(ctx context.Context, addr *sonm.Addr) (net.Conn, error) {
-	remoteAddr, err := addr.IntoTCP()
-	if err != nil {
-		return nil, err
-	}
-
-	var errs = multierror.NewMultiError()
-	for i := 0; i < m.maxPunchAttempts; i++ {
-		conn, err := DialContext(ctx, protocol, m.rendezvousClient.LocalAddr().String(), remoteAddr.String())
-		if err != nil {
-			errs = multierror.AppendUnique(errs, err)
-			continue
-		}
-
-		return conn, nil
-	}
-
-	return nil, errs.ErrorOrNil()
 }
 
 func (m *natPuncherSTCP) RendezvousAddr() net.Addr {
