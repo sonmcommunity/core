@@ -69,6 +69,7 @@ func (m *quicPuncher) listen() error {
 	if err != nil {
 		return err
 	}
+	// todo: CLSOE?????
 
 	wrappedListener := xnet.QUICListener{Listener: listener}
 
@@ -119,7 +120,7 @@ func (m *quicPuncher) AcceptContext(ctx context.Context) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 
-	conn, err := m.punch(ctx, addrs, &serverConnectionWatcher{Queue: m.pendingConnections, Log: m.log.Desugar()}, true)
+	conn, err := m.punch(ctx, addrs, &serverConnectionWatcherDeprecated{Queue: m.pendingConnections, Log: m.log.Desugar()}, true)
 	if err != nil {
 		return nil, newRendezvousError(err)
 	}
@@ -206,7 +207,7 @@ func (m *quicPuncher) DialContext(ctx context.Context, addr common.Address) (net
 		return nil, err
 	}
 
-	return m.punch(ctx, addrs, clientConnectionWatcher{}, false)
+	return m.punch(ctx, addrs, clientConnectionWatcherDeprecated{}, false)
 }
 
 func (m *quicPuncher) resolve(ctx context.Context, addr common.Address) (*sonm.RendezvousReply, error) {

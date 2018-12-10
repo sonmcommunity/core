@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/sonm-io/core/insonmnia/logging"
 	"github.com/sonm-io/core/insonmnia/npp/relay"
 	"github.com/sonm-io/core/insonmnia/npp/rendezvous"
 	"github.com/sonm-io/core/proto"
@@ -23,10 +24,13 @@ const (
 type Option func(o *options) error
 
 type puncherFactory func(ctx context.Context) (NATPuncher, error)
+type puncherServerFactory func(ctx context.Context) (*natPuncherSTCP, error)
+type puncherClientFactory func(ctx context.Context) (*natPuncherCTCP, error)
 
 type options struct {
 	log                   *zap.Logger
-	puncherNew            puncherFactory
+	puncherNewServer      puncherServerFactory
+	puncherNewClient      puncherClientFactory
 	puncherNewQUIC        puncherFactory
 	nppBacklog            int
 	nppMinBackoffInterval time.Duration
@@ -60,7 +64,8 @@ func WithRendezvous(cfg rendezvous.Config, credentials *xgrpc.TransportCredentia
 			return nil
 		}
 
-		o.puncherNew = newTCPPuncherFactory(cfg, credentials, o)
+		o.puncherNewClient = newCTCPPuncherFactory(cfg, credentials, o)
+		o.puncherNewServer = newSTCPPuncherFactory(cfg, credentials, o)
 
 		if credentials.TLSConfig != nil {
 			// Preliminary create and save UDP socket for QUIC communication.
@@ -84,8 +89,8 @@ func WithRendezvous(cfg rendezvous.Config, credentials *xgrpc.TransportCredentia
 	}
 }
 
-func newTCPPuncherFactory(cfg rendezvous.Config, credentials *xgrpc.TransportCredentials, options *options) puncherFactory {
-	return func(ctx context.Context) (NATPuncher, error) {
+func newCTCPPuncherFactory(cfg rendezvous.Config, credentials *xgrpc.TransportCredentials, options *options) puncherClientFactory {
+	return func(ctx context.Context) (*natPuncherCTCP, error) {
 		errs := multierror.NewMultiError()
 
 		for _, addr := range cfg.Endpoints {
@@ -95,7 +100,26 @@ func newTCPPuncherFactory(cfg rendezvous.Config, credentials *xgrpc.TransportCre
 				continue
 			}
 
-			return newNATPuncher(ctx, cfg, client, options.Protocol, options.log)
+			return newNATPuncherClientTCP(client, options.Protocol, logging.WithTrace(ctx, options.log).Sugar())
+		}
+
+		return nil, fmt.Errorf("failed to connect to %+v: %v", cfg.Endpoints, errs.Error())
+	}
+}
+
+func newSTCPPuncherFactory(cfg rendezvous.Config, credentials *xgrpc.TransportCredentials, options *options) puncherServerFactory {
+	return func(ctx context.Context) (*natPuncherSTCP, error) {
+		errs := multierror.NewMultiError()
+
+		for _, addr := range cfg.Endpoints {
+			client, err := newRendezvousClient(ctx, addr, credentials)
+			if err != nil {
+				errs = multierror.AppendUnique(errs, err)
+				continue
+			}
+
+			log := logging.WithTrace(ctx, options.log.With(zap.String("protocol", options.Protocol)))
+			return newNATPuncherServerTCP(client, options.Protocol, log.Sugar())
 		}
 
 		return nil, fmt.Errorf("failed to connect to %+v: %v", cfg.Endpoints, errs.Error())

@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	prometheusIO "github.com/prometheus/client_model/go"
 	"github.com/sonm-io/core/insonmnia/auth"
+	"github.com/sonm-io/core/insonmnia/logging"
 	"github.com/sonm-io/core/insonmnia/npp/relay"
 	"go.uber.org/zap"
 )
@@ -26,7 +28,7 @@ import (
 type Dialer struct {
 	log *zap.Logger
 
-	puncherNew     puncherFactory
+	puncherNew     puncherClientFactory
 	puncherNewQUIC puncherFactory
 	relayDialer    *relay.Dialer
 
@@ -46,7 +48,7 @@ func NewDialer(options ...Option) (*Dialer, error) {
 
 	return &Dialer{
 		log:            opts.log,
-		puncherNew:     opts.puncherNew,
+		puncherNew:     opts.puncherNewClient,
 		puncherNewQUIC: opts.puncherNewQUIC,
 		relayDialer:    opts.relayDialer,
 		metrics:        map[string]*dialMetrics{},
@@ -66,12 +68,17 @@ func (m *Dialer) Dial(addr auth.Addr) (net.Conn, error) {
 // connected, any expiration of the context will not affect the
 // connection.
 func (m *Dialer) DialContext(ctx context.Context, addr auth.Addr) (net.Conn, error) {
+	span := opentracing.SpanFromContext(ctx)
+	if span == nil {
+		span, ctx = opentracing.StartSpanFromContext(ctx, "npp.dial")
+	}
+
+	log := logging.WithTrace(ctx, m.log.With(zap.Stringer("remote", addr)))
+
 	now := time.Now()
 	metric := m.metricHandle(addr)
 	metric.NumAttempts.Inc()
 	metric.LastTimeActive.SetToCurrentTime()
-
-	log := m.log.With(zap.Stringer("remote_addr", addr))
 
 	conn, err := m.dialContextExt(ctx, addr, metric)
 	if err != nil {
@@ -80,7 +87,7 @@ func (m *Dialer) DialContext(ctx context.Context, addr auth.Addr) (net.Conn, err
 		return nil, err
 	}
 
-	log = log.With(zap.Stringer("remote_peer", conn.RemoteAddr()))
+	log = log.With(zap.Stringer("remote_add", conn.RemoteAddr()))
 
 	switch conn.Source {
 	case sourceDirectConnection:
@@ -105,7 +112,8 @@ func (m *Dialer) DialContext(ctx context.Context, addr auth.Addr) (net.Conn, err
 }
 
 func (m *Dialer) dialContextExt(ctx context.Context, addr auth.Addr, metric *dialMetrics) (*nppConn, error) {
-	m.log.Debug("connecting to remote peer", zap.Stringer("remote_addr", addr))
+	log := logging.WithTrace(ctx, m.log)
+	log.Debug("connecting to remote peer", zap.Stringer("remote", addr))
 
 	if conn := m.dialDirect(ctx, addr); conn != nil {
 		return conn, nil
@@ -133,8 +141,7 @@ func (m *Dialer) dialContextExt(ctx context.Context, addr auth.Addr, metric *dia
 // Note, that this method acts as an optimization.
 func (m *Dialer) dialDirect(ctx context.Context, addr auth.Addr) *nppConn {
 	now := time.Now()
-
-	log := m.log.With(zap.Stringer("remote_addr", addr))
+	log := logging.WithTrace(ctx, m.log.With(zap.Stringer("remote", addr)))
 	log.Debug("connecting using direct TCP")
 
 	netAddr, err := addr.Addr()
@@ -161,7 +168,7 @@ func (m *Dialer) dialQUICNPP(ctx context.Context, addr common.Address) *nppConn 
 	now := time.Now()
 
 	timeout := 5 * time.Second
-	log := m.log.With(zap.Stringer("remoteAddr", addr))
+	log := logging.WithTrace(ctx, m.log.With(zap.Stringer("remote", addr)))
 	log.Debug("connecting using QUIC NPP", zap.Duration("timeout", timeout))
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -191,7 +198,7 @@ func (m *Dialer) dialQUICNPP(ctx context.Context, addr common.Address) *nppConn 
 
 		log.Warn("failed to connect using QUIC NPP", zap.Error(err))
 	case <-ctx.Done():
-		go drainConnChannel(nppChannel)
+		go drainConnResultChannel(nppChannel)
 		log.Warn("failed to connect using QUIC NPP", zap.Error(ctx.Err()))
 	}
 
@@ -206,7 +213,7 @@ func (m *Dialer) dialNPP(ctx context.Context, addr common.Address) *nppConn {
 	now := time.Now()
 
 	timeout := 5 * time.Second
-	log := m.log.With(zap.Stringer("remote_addr", addr))
+	log := logging.WithTrace(ctx, m.log.With(zap.Stringer("remote", addr)))
 	log.Debug("connecting using NPP", zap.Duration("timeout", timeout))
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -224,7 +231,7 @@ func (m *Dialer) dialNPP(ctx context.Context, addr common.Address) *nppConn {
 		}
 		defer puncher.Close()
 
-		nppChannel <- newConnTuple(puncher.Dial(addr))
+		nppChannel <- newConnTuple(puncher.DialContext(ctx, addr))
 	}()
 
 	select {
@@ -236,7 +243,7 @@ func (m *Dialer) dialNPP(ctx context.Context, addr common.Address) *nppConn {
 
 		log.Warn("failed to connect using NPP", zap.Error(err))
 	case <-ctx.Done():
-		go drainConnChannel(nppChannel)
+		go drainConnResultChannel(nppChannel)
 		log.Warn("failed to connect using NPP", zap.Error(ctx.Err()))
 	}
 
@@ -250,7 +257,7 @@ func (m *Dialer) dialRelayed(ctx context.Context, addr common.Address) (*nppConn
 
 	now := time.Now()
 
-	log := m.log.With(zap.Stringer("remote_addr", addr))
+	log := logging.WithTrace(ctx, m.log.With(zap.Stringer("remote", addr)))
 	log.Debug("connecting using Relay")
 
 	channel := make(chan connTuple)
@@ -270,7 +277,7 @@ func (m *Dialer) dialRelayed(ctx context.Context, addr common.Address) (*nppConn
 		return newRelayedNPPConn(conn.conn, time.Since(now)), nil
 	case <-ctx.Done():
 		log.Warn("failed to connect using Relay", zap.Error(ctx.Err()))
-		go drainConnChannel(channel)
+		go drainConnResultChannel(channel)
 		return nil, ctx.Err()
 	}
 }
@@ -369,8 +376,12 @@ func newRelayedNPPConn(conn net.Conn, duration time.Duration) *nppConn {
 	}
 }
 
-func drainConnChannel(channel <-chan connTuple) {
+func drainConnResultChannel(channel <-chan connTuple) {
+	if channel == nil {
+		return
+	}
+
 	for conn := range channel {
-		conn.Close()
+		_ = conn.Close()
 	}
 }

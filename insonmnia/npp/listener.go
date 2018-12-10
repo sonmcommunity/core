@@ -71,8 +71,8 @@ type Listener struct {
 	listener        net.Listener
 	listenerChannel chan connTuple
 
-	puncher    NATPuncher
-	puncherNew func(ctx context.Context) (NATPuncher, error)
+	puncher    *natPuncherSTCP
+	puncherNew puncherServerFactory
 	nppChannel chan connTuple
 
 	puncherQUIC    NATPuncher
@@ -114,7 +114,7 @@ func NewListener(ctx context.Context, addr string, options ...Option) (*Listener
 		listenerChannel: channel,
 		listener:        listener,
 		puncher:         nil,
-		puncherNew:      opts.puncherNew,
+		puncherNew:      opts.puncherNewServer,
 		nppChannel:      make(chan connTuple, opts.nppBacklog),
 
 		puncherQUIC:    nil,
@@ -232,7 +232,7 @@ func (m *Listener) listenPuncher(ctx context.Context) error {
 				continue
 			}
 
-			m.log.Debug("puncher has been constructed", zap.Stringer("remote", puncher.RemoteAddr()))
+			m.log.Debug("puncher has been constructed", zap.Stringer("remote", puncher.RendezvousAddr()))
 			m.puncher = puncher
 
 			timeout = m.minBackoffInterval
@@ -387,7 +387,7 @@ func (m *Listener) Addr() net.Addr {
 func (m *Listener) Metrics() ListenerMetrics {
 	var rendezvousAddr net.Addr
 	if m.puncher != nil {
-		rendezvousAddr = m.puncher.RemoteAddr()
+		rendezvousAddr = m.puncher.RendezvousAddr()
 	}
 
 	return ListenerMetrics{
