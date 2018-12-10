@@ -86,5 +86,5 @@ func FormatAddrs(addrs ...*Addr) string {
 		formatted[id] = fmt.Sprintf("%s:%d", addr.GetAddr().GetAddr(), addr.GetAddr().GetPort())
 	}
 
-	return strings.Join(formatted, ", ")
+	return fmt.Sprintf("[%s]", strings.Join(formatted, ", "))
 }

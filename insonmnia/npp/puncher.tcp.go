@@ -120,6 +120,10 @@ type natPuncherTCPBase struct {
 	rendezvousClient *rendezvousClient
 	// PassiveConnectionTxRx is a channel where all connection results from the
 	// local listener will be placed.
+	// Errors should be placed here only when everything is bad, i.e. the
+	// puncher is unable to continue its work. This can be, for example, when
+	// the connection to Rendezvous is dead.
+	// Strictly speaking, only in case of non-temporary errors.
 	passiveConnectionTxRx chan connResult
 	// MaxPunchAttempts shows how many attempts should we made to penetrate the
 	// NAT in case of failed connection attempt.
@@ -152,6 +156,10 @@ func newNatPuncherTCPBase(rendezvousClient *rendezvousClient, protocol string, l
 	}
 
 	return m, nil
+}
+
+func (m *natPuncherTCPBase) RendezvousAddr() net.Addr {
+	return m.rendezvousClient.RemoteAddr()
 }
 
 // PunchAddr tries to establish a TCP connection to the specified address,
@@ -222,12 +230,14 @@ func (m *natPuncherCTCP) DialContext(ctx context.Context, addr common.Address) (
 				continue
 			}
 
+			m.log.With("punch", "passive").Debugf("received NPP connection from %s", connResult.RemoteAddr())
 			return connResult.Unwrap()
 		case connResult := <-activeConnectionTxRx:
 			if connResult.Error() != nil {
 				continue
 			}
 
+			m.log.With("punch", "active").Debugf("received NPP connection from %s", connResult.RemoteAddr())
 			return connResult.Unwrap()
 		}
 	}
@@ -398,8 +408,16 @@ func (m *natPuncherSTCP) AcceptContext(ctx context.Context) (net.Conn, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case connResult := <-m.activeConnectionTxRx:
+		if connResult.conn != nil {
+			m.log.With("punch", "active").Debugf("received NPP connection from %s", connResult.RemoteAddr())
+		}
+
 		return connResult.Unwrap()
 	case connResult := <-m.passiveConnectionTxRx:
+		if connResult.conn != nil {
+			m.log.With("punch", "passive").Debugf("received NPP connection from %s", connResult.RemoteAddr())
+		}
+
 		return connResult.Unwrap()
 	}
 }
@@ -468,7 +486,7 @@ func (m *natPuncherSTCP) punch(ctx context.Context, addrs []*sonm.Addr) {
 	go m.doPunch(ctx, addrs, readinessChannel, &serverConnectionWatcher{ConnectionTxRx: m.activeConnectionTxRx, Log: m.log})
 
 	if err := <-readinessChannel; err != nil {
-		m.log.Warn("failed to punch", zap.Any("addrs", addrs), zap.Error(err))
+		m.log.Debugf("failed to actively punch %s: %v", sonm.FormatAddrs(addrs...), err)
 	}
 }
 
@@ -488,14 +506,7 @@ func (m *natPuncherSTCP) doPunch(ctx context.Context, addrs []*sonm.Addr, readin
 		go func() {
 			defer wg.Done()
 
-			conn, err := m.punchAddr(ctx, addr)
-			if err != nil {
-				m.log.Debugw("failed to punch NPP connection candidate", zap.Error(err))
-			} else {
-				m.log.Debugf("received NPP connection candidate to %s", *addr)
-			}
-
-			pendingTxRx <- newConnResult(conn, err)
+			pendingTxRx <- newConnResult(m.punchAddr(ctx, addr))
 		}()
 	}
 
@@ -533,10 +544,6 @@ func (m *natPuncherSTCP) doPunch(ctx context.Context, addrs []*sonm.Addr, readin
 	if peer == nil {
 		readinessChannel <- fmt.Errorf("failed to punch the network using NPP: all attempts has failed - %s", errs.Error())
 	}
-}
-
-func (m *natPuncherSTCP) RendezvousAddr() net.Addr {
-	return m.rendezvousClient.RemoteAddr()
 }
 
 // Close closes this TCP NAT puncher, freeing all associated resources.
