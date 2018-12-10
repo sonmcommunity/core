@@ -24,7 +24,7 @@ type quicPuncher struct {
 	rendezvousClient *rendezvousClient
 	tlsConfig        *tls.Config
 
-	listenerChannel    chan connTuple
+	listenerChannel    chan connResult
 	pendingConnections *lane.Queue
 	protocol           string
 
@@ -42,7 +42,7 @@ func newQUICPuncher(rendezvousClient *rendezvousClient, tlsConfig *tls.Config, p
 		rendezvousClient: rendezvousClient,
 		tlsConfig:        tlsConfig,
 
-		listenerChannel:    make(chan connTuple, 1),
+		listenerChannel:    make(chan connResult, 1),
 		pendingConnections: lane.NewQueue(),
 		protocol:           strings.Join([]string{transportProtocol, protocol}, "+"),
 
@@ -75,7 +75,7 @@ func (m *quicPuncher) listen() error {
 
 	for {
 		conn, err := wrappedListener.Accept()
-		m.listenerChannel <- newConnTuple(conn, err)
+		m.listenerChannel <- newConnResult(conn, err)
 		switch {
 		case err == nil:
 			//case strings.Contains(err.Error(), "use of closed network connection"):
@@ -100,7 +100,7 @@ func (m *quicPuncher) AcceptContext(ctx context.Context) (net.Conn, error) {
 			m.log.Infof("received acceptor peer from %s", conn.RemoteAddr())
 		}
 
-		return conn.unwrap()
+		return conn.Unwrap()
 	default:
 	}
 
@@ -141,7 +141,7 @@ func (m *quicPuncher) punch(ctx context.Context, addrs *sonm.RendezvousReply, wa
 		return nil, fmt.Errorf("no addresses resolved")
 	}
 
-	channel := make(chan connTuple, 1)
+	channel := make(chan connResult, 1)
 	go m.doPunch(ctx, addrs, channel, watcher)
 
 	// todo: out of band conns.
@@ -151,28 +151,28 @@ func (m *quicPuncher) punch(ctx context.Context, addrs *sonm.RendezvousReply, wa
 			return nil, ctx.Err()
 		case conn := <-channel:
 			if !isServer {
-				return conn.unwrap()
+				return conn.Unwrap()
 			}
 		case conn := <-m.listenerChannel:
 			if isServer {
-				return conn.unwrap()
+				return conn.Unwrap()
 			}
 			// todo: what to do if not?
 		}
 	}
 }
 
-func (m *quicPuncher) doPunch(ctx context.Context, addrs *sonm.RendezvousReply, channel chan<- connTuple, watcher connectionWatcher) {
+func (m *quicPuncher) doPunch(ctx context.Context, addrs *sonm.RendezvousReply, channel chan<- connResult, watcher connectionWatcher) {
 	m.log.Debugf("punching %s", *addrs)
 
 	conn, err := m.punchAddr(ctx, addrs.PublicAddr)
 	if err != nil {
-		channel <- newConnTuple(nil, err)
+		channel <- newConnResult(nil, err)
 		return
 	}
 
 	m.log.Debugf("received NPP NAT connection candidate: %s", *addrs.PublicAddr)
-	channel <- newConnTuple(conn, nil)
+	channel <- newConnResult(conn, nil)
 }
 
 func (m *quicPuncher) punchAddr(ctx context.Context, addr *sonm.Addr) (net.Conn, error) {

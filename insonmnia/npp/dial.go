@@ -87,7 +87,7 @@ func (m *Dialer) DialContext(ctx context.Context, addr auth.Addr) (net.Conn, err
 		return nil, err
 	}
 
-	log = log.With(zap.Stringer("remote_add", conn.RemoteAddr()))
+	log = log.With(zap.Stringer("remote_addr", conn.RemoteAddr()))
 
 	switch conn.Source {
 	case sourceDirectConnection:
@@ -174,19 +174,19 @@ func (m *Dialer) dialQUICNPP(ctx context.Context, addr common.Address) *nppConn 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	nppChannel := make(chan connTuple)
+	nppChannel := make(chan connResult)
 
 	go func() {
 		defer close(nppChannel)
 
 		puncher, err := m.puncherNewQUIC(ctx)
 		if err != nil {
-			nppChannel <- newConnTuple(nil, err)
+			nppChannel <- newConnResult(nil, err)
 			return
 		}
 		defer puncher.Close()
 
-		nppChannel <- newConnTuple(puncher.Dial(addr))
+		nppChannel <- newConnResult(puncher.Dial(addr))
 	}()
 
 	select {
@@ -219,19 +219,19 @@ func (m *Dialer) dialNPP(ctx context.Context, addr common.Address) *nppConn {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	nppChannel := make(chan connTuple)
+	nppChannel := make(chan connResult)
 
 	go func() {
 		defer close(nppChannel)
 
 		puncher, err := m.puncherNew(ctx)
 		if err != nil {
-			nppChannel <- newConnTuple(nil, err)
+			nppChannel <- newConnResult(nil, err)
 			return
 		}
 		defer puncher.Close()
 
-		nppChannel <- newConnTuple(puncher.DialContext(ctx, addr))
+		nppChannel <- newConnResult(puncher.DialContext(ctx, addr))
 	}()
 
 	select {
@@ -260,11 +260,11 @@ func (m *Dialer) dialRelayed(ctx context.Context, addr common.Address) (*nppConn
 	log := logging.WithTrace(ctx, m.log.With(zap.Stringer("remote", addr)))
 	log.Debug("connecting using Relay")
 
-	channel := make(chan connTuple)
+	channel := make(chan connResult)
 	go func() {
 		defer close(channel)
 
-		channel <- newConnTuple(m.relayDialer.Dial(addr))
+		channel <- newConnResult(m.relayDialer.Dial(addr))
 	}()
 
 	select {
@@ -376,7 +376,7 @@ func newRelayedNPPConn(conn net.Conn, duration time.Duration) *nppConn {
 	}
 }
 
-func drainConnResultChannel(channel <-chan connTuple) {
+func drainConnResultChannel(channel <-chan connResult) {
 	if channel == nil {
 		return
 	}

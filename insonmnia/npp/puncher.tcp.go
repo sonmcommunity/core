@@ -15,24 +15,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// Added:
-// - Dialer requests and logs are now traced.
-// Fixed:
-// - Local TCP listener in the puncher now properly handles temporary errors, such as reaching fd limit, and no longer terminates the listening process.
-// - Sockets and fd leak in both client and server implementation.
-
-type connResult = connTuple
-
-var newConnResult = newConnTuple
-
-func newConnResultOk(conn net.Conn) connResult {
-	return newConnResult(conn, nil)
-}
-
-func newConnResultErr(err error) connResult {
-	return newConnResult(nil, err)
-}
-
 type connectionWatcher interface {
 	OnMoreConnections(conn net.Conn)
 }
@@ -199,13 +181,13 @@ func (m *natPuncherCTCP) DialContext(ctx context.Context, addr common.Address) (
 				continue
 			}
 
-			return connResult.unwrap()
+			return connResult.Unwrap()
 		case connResult := <-activeConnectionTxRx:
 			if connResult.Error() != nil {
 				continue
 			}
 
-			return connResult.unwrap()
+			return connResult.Unwrap()
 		}
 	}
 }
@@ -432,9 +414,9 @@ func (m *natPuncherSTCP) AcceptContext(ctx context.Context) (net.Conn, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case connResult := <-m.activeConnectionTxRx:
-		return connResult.unwrap()
+		return connResult.Unwrap()
 	case connResult := <-m.passiveConnectionTxRx:
-		return connResult.unwrap()
+		return connResult.Unwrap()
 	}
 }
 
@@ -468,6 +450,7 @@ func (m *natPuncherSTCP) run(ctx context.Context) {
 				continue
 			}
 
+			m.numPunchesInProgress.Inc()
 			go m.punch(ctx, publishResponse.GetAddresses())
 		}
 	}
@@ -493,7 +476,6 @@ func (m *natPuncherSTCP) publish(ctx context.Context) (*sonm.RendezvousReply, er
 
 // todo: docs.
 func (m *natPuncherSTCP) punch(ctx context.Context, addrs []*sonm.Addr) {
-	m.numPunchesInProgress.Inc()
 	defer func() { m.numPunchesInProgress.Dec(); m.readinessTxRx <- struct{}{} }()
 
 	if len(addrs) == 0 {
@@ -604,6 +586,9 @@ func (m *natPuncherSTCP) RendezvousAddr() net.Addr {
 //
 // The puncher becomes unusable after calling this method.
 func (m *natPuncherSTCP) Close() error {
+	defer func() { go drainConnResultChannel(m.activeConnectionTxRx) }()
+	defer func() { go drainConnResultChannel(m.passiveConnectionTxRx) }()
+
 	m.cancelFunc()
 
 	errs := multierror.NewMultiError()
@@ -615,8 +600,6 @@ func (m *natPuncherSTCP) Close() error {
 	if err := m.listener.Close(); err != nil {
 		errs = multierror.Append(errs, err)
 	}
-
-	// todo: drain "passiveConnectionTxRx".
 
 	return errs.ErrorOrNil()
 }
