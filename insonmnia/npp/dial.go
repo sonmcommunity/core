@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/opentracing/basictracer-go"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	prometheusIO "github.com/prometheus/client_model/go"
@@ -68,10 +69,10 @@ func (m *Dialer) Dial(addr auth.Addr) (net.Conn, error) {
 // connected, any expiration of the context will not affect the
 // connection.
 func (m *Dialer) DialContext(ctx context.Context, addr auth.Addr) (net.Conn, error) {
-	// todo: ЖЪРЧИК!1 1 !!1ЖЪРЧИК УЛЬТРАЗВУК?7 7СЕМСЕМИСКАЖЕНИЯ РОЗУПЛОТНИЕ ЗИЯЮЩАЯ ПУТСОТА ENGSOM YOURSELF?7 7СЕМСЕМНЕВОЪОБРАЗИМАЯ ЭНЕРГЙЯ!1 1 !!1СПЕКТР1111101001010 ТЕЛОИД КОГДА Ж МНЕЯ ОПТУСТИ?7 7СЕМСЕМЯИДИОТ СУЧЕЧКА!!111 ЕБОНИСЬ НАОТЛИЧНЕНЬКО!1 1 !!1НЕВОЪОБРАЗИМАЯ ЭНЕРГЙЯ1111101001010 ENGSOM YOURSELF!1 1 !!1ГИПЕРПСТО?7 7СЕМСЕМА ВПРОЧЕМ НЕ НАДО КИЛСТОНОЕ БИЗЕ!1 1 !!1КИЛСТОНОЕ БИЗЕ СРУ РОЗУПЛОТНИЕ??7 7? НАГВАЛЬНИ БЕЗМОЛВЦА ИПИЛЕПСИ ЪЖСЛО ПОТС ЗОХВАЧЕН ТЕОРИЯ ТСРУН ГИПЕРПСТО КАТСАНЕДА1111101001010 ЕБАТЬ КАК Я ЛЮБЛЮ КИСЛОТНЙХ КОТЙКОВ?7 7СЕМСЕММЕДУЗА ПРДУНЬ ПДРУНЬ УЛЬТРАФИОЛТЕ!1 1 !!1ХУЙПИЗДА КОСМОСУ НУЖЕН ТВОЙ РАЗУМ??7 7? ТЕОРИЯ ТСРУН!1 1РАСРАС НЕВОЪОБРАЗИМАЯ ЭНЕРГЙЯ КИЛСТОНОЕ БИЗЕ МЮОНЫ ГОЛАКТЕКО ОПАСНОСТЕ!1 1 !!1РАСШИРЕНИЕ ЩАЧЛА
 	span := opentracing.SpanFromContext(ctx)
 	if span == nil {
-		if _, ok := opentracing.GlobalTracer().(*opentracing.NoopTracer); !ok {
+		switch opentracing.GlobalTracer().(type) {
+		case basictracer.Tracer:
 			span, ctx = opentracing.StartSpanFromContext(ctx, "npp.dial")
 		}
 	}
