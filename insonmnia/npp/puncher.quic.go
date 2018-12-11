@@ -54,8 +54,7 @@ func newNATPuncherQUICBase(rendezvousClient *rendezvousClient, tlsConfig *tls.Co
 		protocol:              protocol,
 		listener:              newChanListener(&xnet.BackPressureListener{Listener: &xnet.QUICListener{Listener: listener}, Log: log.Desugar()}, connectionTxRx),
 		passiveConnectionTxRx: connectionTxRx,
-
-		log: log.With(zap.String("protocol", protocol)),
+		log:                   log.With(zap.String("protocol", protocol)),
 	}
 
 	return m, nil
@@ -237,8 +236,6 @@ type natPuncherServerQUIC struct {
 	numPunchesInProgress *atomic.Uint32
 	activeConnectionTxRx chan connResult
 	cancelFunc           context.CancelFunc
-
-	log *zap.SugaredLogger
 }
 
 func newNATPuncherServerQUIC(rendezvousClient *rendezvousClient, tlsConfig *tls.Config, protocol string, log *zap.SugaredLogger) (*natPuncherServerQUIC, error) {
@@ -263,8 +260,6 @@ func newNATPuncherServerQUIC(rendezvousClient *rendezvousClient, tlsConfig *tls.
 		numPunchesInProgress: atomic.NewUint32(0),
 		activeConnectionTxRx: activeConnectionTxRx,
 		cancelFunc:           cancel,
-
-		log: log.With(zap.String("protocol", protocol)),
 	}
 
 	go m.run(ctx)
