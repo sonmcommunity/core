@@ -224,6 +224,10 @@ func (m *natPuncherCTCP) DialContext(ctx context.Context, addr common.Address) (
 	defer func() { go drainConnResultChannel(activeConnectionTxRx) }()
 
 	for {
+		if activeConnectionTxRx == nil && m.passiveConnectionTxRx == nil {
+			return nil, fmt.Errorf("canceled")
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -234,7 +238,12 @@ func (m *natPuncherCTCP) DialContext(ctx context.Context, addr common.Address) (
 
 			m.log.With("punch", "passive").Debugf("received NPP connection from %s", connResult.RemoteAddr())
 			return connResult.Unwrap()
-		case connResult := <-activeConnectionTxRx:
+		case connResult, ok := <-activeConnectionTxRx:
+			if !ok {
+				activeConnectionTxRx = nil
+				continue
+			}
+
 			if connResult.Error() != nil {
 				continue
 			}
