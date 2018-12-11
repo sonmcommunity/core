@@ -70,7 +70,9 @@ func (m *Dialer) Dial(addr auth.Addr) (net.Conn, error) {
 func (m *Dialer) DialContext(ctx context.Context, addr auth.Addr) (net.Conn, error) {
 	span := opentracing.SpanFromContext(ctx)
 	if span == nil {
-		span, ctx = opentracing.StartSpanFromContext(ctx, "npp.dial")
+		if _, ok := opentracing.GlobalTracer().(*opentracing.NoopTracer); !ok {
+			span, ctx = opentracing.StartSpanFromContext(ctx, "npp.dial")
+		}
 	}
 
 	log := logging.WithTrace(ctx, m.log.With(zap.Stringer("remote", addr)))
