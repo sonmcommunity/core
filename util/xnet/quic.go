@@ -108,7 +108,7 @@ func (m *QUICListener) Accept() (net.Conn, error) {
 	}
 
 	stream, err := session.AcceptStream()
-	if err != nil {
+	if err != nil && !isPeerGoneErr(err) {
 		return nil, newQUICError(err)
 	}
 
@@ -118,4 +118,12 @@ func (m *QUICListener) Accept() (net.Conn, error) {
 	}
 
 	return conn, nil
+}
+
+func isPeerGoneErr(err error) bool {
+	if qErr, ok := err.(*qerr.QuicError); ok && qErr.ErrorCode != qerr.PeerGoingAway {
+		return true
+	}
+
+	return false
 }

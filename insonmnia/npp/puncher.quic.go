@@ -113,13 +113,18 @@ func (m *natPuncherClientQUIC) DialContext(ctx context.Context, addr common.Addr
 
 	for {
 		if activeConnectionTxRx == nil && m.passiveConnectionTxRx == nil {
-			return nil, fmt.Errorf("canceled")
+			return nil, newRendezvousError(fmt.Errorf("failed to dial"))
 		}
 
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case connResult := <-m.passiveConnectionTxRx:
+		case connResult, ok := <-m.passiveConnectionTxRx:
+			if !ok {
+				m.passiveConnectionTxRx = nil
+				continue
+			}
+
 			if connResult.Error() != nil {
 				m.log.With("punch", "passive").Debugf("received NPP error from: %v", connResult.Error())
 				continue
