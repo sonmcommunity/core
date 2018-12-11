@@ -31,8 +31,8 @@ type Listener struct {
 	puncherNew puncherServerFactory
 	nppChannel chan connResult
 
-	puncherQUIC    NATPuncher
-	puncherNewQUIC func(ctx context.Context) (NATPuncher, error)
+	puncherQUIC    *natPuncherServerQUIC
+	puncherNewQUIC puncherServerQUICFactory
 
 	relayListener    *relay.Listener
 	relayChannel     chan connResult
@@ -74,7 +74,7 @@ func NewListener(ctx context.Context, addr string, options ...Option) (*Listener
 		nppChannel:      make(chan connResult, opts.nppBacklog),
 
 		puncherQUIC:    nil,
-		puncherNewQUIC: opts.puncherNewQUIC,
+		puncherNewQUIC: opts.puncherNewServerQUIC,
 
 		relayListener:    opts.relayListener,
 		relayChannel:     make(chan connResult, opts.nppBacklog),
@@ -139,7 +139,7 @@ func (m *Listener) listenQUIC(ctx context.Context) error {
 				continue
 			}
 
-			m.log.Debug("QUIC puncher has been constructed", zap.Stringer("remote", puncher.RemoteAddr()))
+			m.log.Debug("QUIC puncher has been constructed", zap.Stringer("remote", puncher.RendezvousAddr()))
 			m.puncherQUIC = puncher
 
 			timeout = m.minBackoffInterval
@@ -150,6 +150,7 @@ func (m *Listener) listenQUIC(ctx context.Context) error {
 			// In case of any rendezvous errors it's better to reconnect.
 			// Just in case.
 			// todo: reconnect only if error is on network level.
+			m.log.Warn("RV is dead???", zap.Error(connTuple.Error()))
 			m.puncherQUIC.Close()
 			m.puncherQUIC = nil
 		}
@@ -325,6 +326,11 @@ func (m *Listener) Close() error {
 	}
 	if m.puncher != nil {
 		if err := m.puncher.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if m.puncherQUIC != nil {
+		if err := m.puncherQUIC.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

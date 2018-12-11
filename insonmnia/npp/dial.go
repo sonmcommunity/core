@@ -29,7 +29,7 @@ type Dialer struct {
 	log *zap.Logger
 
 	puncherNew     puncherClientFactory
-	puncherNewQUIC puncherFactory
+	puncherNewQUIC puncherClientQUICFactory
 	relayDialer    *relay.Dialer
 
 	mu      sync.Mutex
@@ -49,7 +49,7 @@ func NewDialer(options ...Option) (*Dialer, error) {
 	return &Dialer{
 		log:            opts.log,
 		puncherNew:     opts.puncherNewClient,
-		puncherNewQUIC: opts.puncherNewQUIC,
+		puncherNewQUIC: opts.puncherNewClientQUIC,
 		relayDialer:    opts.relayDialer,
 		metrics:        map[string]*dialMetrics{},
 	}, nil
@@ -186,7 +186,7 @@ func (m *Dialer) dialQUICNPP(ctx context.Context, addr common.Address) *nppConn 
 		}
 		defer puncher.Close()
 
-		nppChannel <- newConnResult(puncher.Dial(addr))
+		nppChannel <- newConnResult(puncher.DialContext(ctx, addr))
 	}()
 
 	select {

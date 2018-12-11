@@ -5,177 +5,67 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"strings"
-	"time"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/lucas-clemente/quic-go"
 	"github.com/sonm-io/core/proto"
+	"github.com/sonm-io/core/util/multierror"
 	"github.com/sonm-io/core/util/xnet"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
-	"gopkg.in/oleiade/lane.v1"
 )
 
 const (
 	transportProtocol = "quic"
 )
 
-type quicPuncher struct {
-	rendezvousClient *rendezvousClient
-	tlsConfig        *tls.Config
-
-	listenerChannel    chan connResult
-	pendingConnections *lane.Queue
-	protocol           string
-
-	timeout time.Duration
-	log     *zap.SugaredLogger
+type natPuncherQUICBase struct {
+	protocol              string
+	rendezvousClient      *rendezvousClient
+	tlsConfig             *tls.Config
+	listener              *chanListener
+	passiveConnectionTxRx chan connResult
+	log                   *zap.SugaredLogger
 }
 
-func newQUICPuncher(rendezvousClient *rendezvousClient, tlsConfig *tls.Config, protocol string, log *zap.Logger) (*quicPuncher, error) {
+// todo: docs
+func newNATPuncherQUICBase(rendezvousClient *rendezvousClient, tlsConfig *tls.Config, protocol string, log *zap.SugaredLogger) (*natPuncherQUICBase, error) {
 	// TODO: Le soutien.
+	//  Since we have default "tcp" protocol for TCP punching it is
+	//  meaningless for QUIC. Moreover now we treat this parameter as
+	//  application protocol.
 	if protocol == sonm.DefaultNPPProtocol {
 		protocol = "grpc"
 	}
 
-	m := &quicPuncher{
-		rendezvousClient: rendezvousClient,
-		tlsConfig:        tlsConfig,
+	protocol = fmt.Sprintf("%s+%s", transportProtocol, protocol)
 
-		listenerChannel:    make(chan connResult, 1),
-		pendingConnections: lane.NewQueue(),
-		protocol:           strings.Join([]string{transportProtocol, protocol}, "+"),
-
-		timeout: 30 * time.Second,
-		log:     log.With(zap.String("type", "QUIC")).Sugar(),
+	listener, err := quic.Listen(rendezvousClient.UDPConn, tlsConfig, xnet.DefaultQUICConfig())
+	if err != nil {
+		return nil, err
 	}
 
-	go func() {
-		if err := m.listen(); err != nil {
-			m.log.Warn("QUIC listener is closed", zap.Error(err))
-		}
-	}()
+	connectionTxRx := make(chan connResult, 64)
+
+	m := &natPuncherQUICBase{
+		rendezvousClient:      rendezvousClient,
+		tlsConfig:             tlsConfig,
+		protocol:              protocol,
+		listener:              newChanListener(&xnet.BackPressureListener{Listener: &xnet.QUICListener{Listener: listener}, Log: log.Desugar()}, connectionTxRx),
+		passiveConnectionTxRx: connectionTxRx,
+
+		log: log.With(zap.String("protocol", protocol)),
+	}
 
 	return m, nil
 }
 
-func (m *quicPuncher) listen() error {
-	conn := m.rendezvousClient.UDPConn
-
-	m.log.Debugf("exposing QUIC listener on %s", conn.LocalAddr().String())
-	defer m.log.Debugf("finished QUIC listening on %s", conn.LocalAddr().String())
-
-	listener, err := quic.Listen(conn, m.tlsConfig, xnet.DefaultQUICConfig())
-	if err != nil {
-		return err
-	}
-	// todo: CLSOE?????
-
-	wrappedListener := xnet.QUICListener{Listener: listener}
-
-	for {
-		conn, err := wrappedListener.Accept()
-		m.listenerChannel <- newConnResult(conn, err)
-		switch {
-		case err == nil:
-			//case strings.Contains(err.Error(), "use of closed network connection"):
-			//	return err
-		default:
-			m.log.Errorw("failed to listen QUIC NPP", zap.Error(err))
-			return err
-		}
-	}
+func (m *natPuncherQUICBase) RendezvousAddr() net.Addr {
+	return m.rendezvousClient.RemoteAddr()
 }
 
-func (m *quicPuncher) Accept() (net.Conn, error) {
-	return m.AcceptContext(context.Background())
-}
-
-func (m *quicPuncher) AcceptContext(ctx context.Context) (net.Conn, error) {
-	// Check for pending connections in the acceptor from the channel, if
-	// there is a connection - return immediately.
-	select {
-	case conn := <-m.listenerChannel:
-		if err := conn.Error(); err == nil {
-			m.log.Infof("received acceptor peer from %s", conn.RemoteAddr())
-		}
-
-		return conn.Unwrap()
-	default:
-	}
-
-	if conn := m.pendingConnections.Dequeue(); conn != nil {
-		m.log.Debugf("dequeueing pending connection")
-		return conn.(net.Conn), nil
-	}
-
-	addrs, err := m.publish(ctx)
-	if err != nil {
-		m.log.Warnw("failed to publish itself on the rendezvous", zap.Error(err))
-		return nil, newRendezvousError(err)
-	}
-
-	m.log.Infof("received remote peer endpoints: %s", *addrs)
-
-	ctx, cancel := context.WithTimeout(ctx, m.timeout)
-	defer cancel()
-
-	conn, err := m.punch(ctx, addrs, &serverConnectionWatcherDeprecated{Queue: m.pendingConnections, Log: m.log.Desugar()}, true)
-	if err != nil {
-		return nil, newRendezvousError(err)
-	}
-
-	return conn, nil
-}
-
-func (m *quicPuncher) publish(ctx context.Context) (*sonm.RendezvousReply, error) {
-	request := &sonm.PublishRequest{
-		Protocol: m.protocol,
-	}
-
-	return m.rendezvousClient.Publish(ctx, request)
-}
-
-func (m *quicPuncher) punch(ctx context.Context, addrs *sonm.RendezvousReply, watcher connectionWatcher, isServer bool) (net.Conn, error) {
-	if addrs.Empty() {
-		return nil, fmt.Errorf("no addresses resolved")
-	}
-
-	channel := make(chan connResult, 1)
-	go m.doPunch(ctx, addrs, channel, watcher)
-
-	// todo: out of band conns.
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case conn := <-channel:
-			if !isServer {
-				return conn.Unwrap()
-			}
-		case conn := <-m.listenerChannel:
-			if isServer {
-				return conn.Unwrap()
-			}
-			// todo: what to do if not?
-		}
-	}
-}
-
-func (m *quicPuncher) doPunch(ctx context.Context, addrs *sonm.RendezvousReply, channel chan<- connResult, watcher connectionWatcher) {
-	m.log.Debugf("punching %s", *addrs)
-
-	conn, err := m.punchAddr(ctx, addrs.PublicAddr)
-	if err != nil {
-		channel <- newConnResult(nil, err)
-		return
-	}
-
-	m.log.Debugf("received NPP NAT connection candidate: %s", *addrs.PublicAddr)
-	channel <- newConnResult(conn, nil)
-}
-
-func (m *quicPuncher) punchAddr(ctx context.Context, addr *sonm.Addr) (net.Conn, error) {
+func (m *natPuncherQUICBase) punchAddr(ctx context.Context, addr *sonm.Addr) (net.Conn, error) {
 	peerAddr, err := addr.IntoUDP()
 	if err != nil {
 		return nil, err
@@ -193,24 +83,76 @@ func (m *quicPuncher) punchAddr(ctx context.Context, addr *sonm.Addr) (net.Conn,
 	return xnet.NewQUICConn(session)
 }
 
-func (m *quicPuncher) Dial(addr common.Address) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
-	defer cancel()
-
-	return m.DialContext(ctx, addr)
+type natPuncherClientQUIC struct {
+	*natPuncherQUICBase
 }
 
-func (m *quicPuncher) DialContext(ctx context.Context, addr common.Address) (net.Conn, error) {
-	addrs, err := m.resolve(ctx, addr)
+func newNATPuncherClientQUIC(rendezvousClient *rendezvousClient, tlsConfig *tls.Config, protocol string, log *zap.SugaredLogger) (*natPuncherClientQUIC, error) {
+	base, err := newNATPuncherQUICBase(rendezvousClient, tlsConfig, protocol, log)
 	if err != nil {
-		m.log.Warnf("failed to resolve %s using rendezvous: %v", addr.String(), err)
 		return nil, err
 	}
 
-	return m.punch(ctx, addrs, clientConnectionWatcherDeprecated{}, false)
+	return &natPuncherClientQUIC{
+		natPuncherQUICBase: base,
+	}, nil
 }
 
-func (m *quicPuncher) resolve(ctx context.Context, addr common.Address) (*sonm.RendezvousReply, error) {
+func (m *natPuncherClientQUIC) DialContext(ctx context.Context, addr common.Address) (net.Conn, error) {
+	// The first thing we need is to resolve the specified address using Rendezvous server.
+	response, err := m.resolve(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	if response.Empty() {
+		return nil, fmt.Errorf("no addresses resolved")
+	}
+
+	activeConnectionTxRx := m.punch(ctx, response.GetAddresses())
+	defer func() { go drainConnResultChannel(activeConnectionTxRx) }()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case connResult := <-m.passiveConnectionTxRx:
+			if connResult.Error() != nil {
+				m.log.With("punch", "passive").Debugf("received NPP error from: %v", connResult.Error())
+				continue
+			}
+
+			m.log.With("punch", "passive").Debugf("received NPP connection from %s", connResult.RemoteAddr())
+			return connResult.Unwrap()
+		case connResult := <-activeConnectionTxRx:
+			if connResult.Error() != nil {
+				m.log.With("punch", "active").Debugf("received NPP error from: %v", connResult.Error())
+				continue
+			}
+
+			m.log.With("punch", "active").Debugf("received NPP connection from %s", connResult.RemoteAddr())
+			return connResult.Unwrap()
+		}
+	}
+}
+
+func (m *natPuncherClientQUIC) Close() error {
+	defer func() { go drainConnResultChannel(m.passiveConnectionTxRx) }()
+
+	errs := multierror.NewMultiError()
+
+	if err := m.rendezvousClient.Close(); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	if err := m.listener.Close(); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	return errs.ErrorOrNil()
+}
+
+func (m *natPuncherClientQUIC) resolve(ctx context.Context, addr common.Address) (*sonm.RendezvousReply, error) {
 	request := &sonm.ConnectRequest{
 		Protocol:     m.protocol,
 		PrivateAddrs: []*sonm.Addr{},
@@ -220,10 +162,264 @@ func (m *quicPuncher) resolve(ctx context.Context, addr common.Address) (*sonm.R
 	return m.rendezvousClient.Resolve(ctx, request)
 }
 
-func (m *quicPuncher) RemoteAddr() net.Addr {
-	return m.rendezvousClient.RemoteAddr()
+func (m *natPuncherClientQUIC) punch(ctx context.Context, addrs []*sonm.Addr) <-chan connResult {
+	if len(addrs) == 0 {
+		return nil
+	}
+
+	channel := make(chan connResult, 1)
+
+	go m.doPunch(ctx, addrs, channel, &clientConnectionWatcher{Log: m.log})
+
+	return channel
 }
 
-func (m *quicPuncher) Close() error {
-	return m.rendezvousClient.Close()
+func (m *natPuncherClientQUIC) doPunch(ctx context.Context, addrs []*sonm.Addr, readinessChannel chan<- connResult, watcher connectionWatcher) {
+	defer close(readinessChannel)
+
+	m.log.Debugf("punching %d endpoint(s): %s", len(addrs), sonm.FormatAddrs(addrs...))
+
+	// Pending connection queue. Since we perform all connection attempts
+	// asynchronously we must wait until all of them succeeded or errored to
+	// prevent both memory and fd leak.
+	pendingTxRx := make(chan connResult, len(addrs))
+	wg := sync.WaitGroup{}
+	wg.Add(len(addrs))
+
+	for _, addr := range addrs {
+		addr := addr
+
+		go func() {
+			defer wg.Done()
+			pendingTxRx <- newConnResult(m.punchAddr(ctx, addr))
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(pendingTxRx)
+	}()
+
+	var peer net.Conn
+	var errs = multierror.NewMultiError()
+	for connResult := range pendingTxRx {
+		if connResult.Error() != nil {
+			m.log.Debugw("received NPP connection candidate notification", zap.Error(connResult.Error()))
+			errs = multierror.AppendUnique(errs, connResult.Error())
+			continue
+		}
+
+		m.log.Debugf("received NPP connection candidate from %s", connResult.RemoteAddr())
+
+		if peer != nil {
+			// If we're already established a connection the only thing we can
+			// do with the rest - is to put in the queue for further
+			// extraction. The client is responsible to close excess
+			// connections, while on the our side they will be dropped after
+			// being accepted.
+			watcher.OnMoreConnections(connResult.conn)
+		} else {
+			peer = connResult.conn
+			// Do not return here - still need to handle possibly successful connections.
+			readinessChannel <- newConnResultOk(connResult.conn)
+		}
+	}
+
+	if peer == nil {
+		readinessChannel <- newConnResultErr(fmt.Errorf("failed to punch the network using NPP: all attempts has failed - %s", errs.Error()))
+	}
+}
+
+type natPuncherServerQUIC struct {
+	*natPuncherQUICBase
+
+	readinessTxRx        chan struct{}
+	numPunchesInProgress *atomic.Uint32
+	activeConnectionTxRx chan connResult
+	cancelFunc           context.CancelFunc
+
+	log *zap.SugaredLogger
+}
+
+func newNATPuncherServerQUIC(rendezvousClient *rendezvousClient, tlsConfig *tls.Config, protocol string, log *zap.SugaredLogger) (*natPuncherServerQUIC, error) {
+	base, err := newNATPuncherQUICBase(rendezvousClient, tlsConfig, protocol, log)
+	if err != nil {
+		return nil, err
+	}
+
+	readinessTxRx := make(chan struct{}, 16)
+
+	for i := 0; i < cap(readinessTxRx); i++ {
+		readinessTxRx <- struct{}{}
+	}
+
+	activeConnectionTxRx := make(chan connResult, 64)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	m := &natPuncherServerQUIC{
+		natPuncherQUICBase:   base,
+		readinessTxRx:        readinessTxRx,
+		numPunchesInProgress: atomic.NewUint32(0),
+		activeConnectionTxRx: activeConnectionTxRx,
+		cancelFunc:           cancel,
+
+		log: log.With(zap.String("protocol", protocol)),
+	}
+
+	go m.run(ctx)
+
+	return m, nil
+}
+
+func (m *natPuncherServerQUIC) AcceptContext(ctx context.Context) (net.Conn, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case connResult := <-m.activeConnectionTxRx:
+		if connResult.conn != nil {
+			m.log.With("punch", "active").Debugf("received NPP connection from %s", connResult.RemoteAddr())
+		}
+
+		return connResult.Unwrap()
+	case connResult := <-m.passiveConnectionTxRx:
+		if connResult.conn != nil {
+			m.log.With("punch", "passive").Debugf("received NPP connection from %s", connResult.RemoteAddr())
+		}
+
+		return connResult.Unwrap()
+	}
+}
+
+func (m *natPuncherServerQUIC) Close() error {
+	defer func() { go drainConnResultChannel(m.activeConnectionTxRx) }()
+	defer func() { go drainConnResultChannel(m.passiveConnectionTxRx) }()
+
+	m.cancelFunc()
+
+	errs := multierror.NewMultiError()
+
+	if err := m.rendezvousClient.Close(); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	if err := m.listener.Close(); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	return errs.ErrorOrNil()
+}
+
+func (m *natPuncherServerQUIC) run(ctx context.Context) {
+	defer func() {
+		defer close(m.activeConnectionTxRx)
+
+		for {
+			// No pending punches right now and there won't.
+			if m.numPunchesInProgress.Load() == 0 {
+				return
+			}
+
+			// Otherwise wait for currently processing punches finish.
+			<-m.readinessTxRx
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.readinessTxRx:
+			m.log.Debugf("publishing on the Rendezvous server")
+
+			publishResponse, err := m.publish(ctx)
+			if err != nil {
+				m.log.Warnw("failed to publish itself on the rendezvous", zap.Error(err))
+				m.activeConnectionTxRx <- newConnResultErr(newRendezvousError(err))
+				return
+			}
+
+			m.numPunchesInProgress.Inc()
+			go m.punch(ctx, []*sonm.Addr{publishResponse.GetPublicAddr()})
+		}
+	}
+}
+
+func (m *natPuncherServerQUIC) publish(ctx context.Context) (*sonm.RendezvousReply, error) {
+	request := &sonm.PublishRequest{
+		Protocol: m.protocol,
+	}
+
+	return m.rendezvousClient.Publish(ctx, request)
+}
+
+func (m *natPuncherServerQUIC) punch(ctx context.Context, addrs []*sonm.Addr) {
+	defer func() { m.numPunchesInProgress.Dec(); m.readinessTxRx <- struct{}{} }()
+
+	if len(addrs) == 0 {
+		return
+	}
+
+	readinessChannel := make(chan error, 1)
+	go m.doPunch(ctx, addrs, readinessChannel, &serverConnectionWatcher{ConnectionTxRx: m.activeConnectionTxRx, Log: m.log})
+
+	if err := <-readinessChannel; err != nil {
+		m.log.Debugf("failed to actively punch %s: %v", sonm.FormatAddrs(addrs...), err)
+	}
+}
+
+func (m *natPuncherServerQUIC) doPunch(ctx context.Context, addrs []*sonm.Addr, readinessChannel chan<- error, watcher connectionWatcher) {
+	m.log.Debugf("punching %d endpoint(s): %s", len(addrs), sonm.FormatAddrs(addrs...))
+
+	// Pending connection queue. Since we perform all connection attempts
+	// asynchronously we must wait until all of them succeeded or errored to
+	// prevent both memory and fd leak.
+	pendingTxRx := make(chan connResult, len(addrs))
+	wg := sync.WaitGroup{}
+	wg.Add(len(addrs))
+
+	for _, addr := range addrs {
+		addr := addr
+
+		go func() {
+			defer wg.Done()
+
+			pendingTxRx <- newConnResult(m.punchAddr(ctx, addr))
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(pendingTxRx)
+	}()
+
+	var peer net.Conn
+	var errs = multierror.NewMultiError()
+	for connResult := range pendingTxRx {
+		if connResult.Error() != nil {
+			m.log.Debugw("received NPP connection candidate", zap.Error(connResult.Error()))
+			errs = multierror.AppendUnique(errs, connResult.Error())
+			continue
+		}
+
+		m.log.Debugf("received NPP connection candidate from %s", connResult.RemoteAddr())
+
+		if peer != nil {
+			// If we're already established a connection the only thing we can
+			// do with the rest - is to put in the queue for further
+			// extraction. The client is responsible to close excess
+			// connections, while on the our side they will be dropped after
+			// being accepted.
+			watcher.OnMoreConnections(connResult.conn)
+		} else {
+			peer = connResult.conn
+			m.activeConnectionTxRx <- newConnResultOk(connResult.conn)
+			// Do not return here - still need to handle possibly successful connections.
+			readinessChannel <- nil
+		}
+	}
+
+	if peer == nil {
+		readinessChannel <- fmt.Errorf("failed to punch the network using NPP: all attempts has failed - %s", errs.Error())
+	}
 }
