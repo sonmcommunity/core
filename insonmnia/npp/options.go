@@ -134,7 +134,7 @@ func newSQUICPuncherFactory(cfg rendezvous.Config, credentials *xgrpc.TransportC
 		errs := multierror.NewMultiError()
 
 		for _, addr := range cfg.Endpoints {
-			client, err := newRendezvousQUICClient(ctx, conn, addr, credentials)
+			client, err := newRendezvousClientQUIC(ctx, conn, addr, credentials)
 			if err != nil {
 				errs = multierror.AppendUnique(errs, err)
 				continue
@@ -153,7 +153,7 @@ func newCQUICPuncherFactory(cfg rendezvous.Config, credentials *xgrpc.TransportC
 		errs := multierror.NewMultiError()
 
 		for _, addr := range cfg.Endpoints {
-			client, err := newRendezvousQUICClient(ctx, conn, addr, credentials)
+			client, err := newRendezvousClientQUIC(ctx, conn, addr, credentials)
 			if err != nil {
 				errs = multierror.AppendUnique(errs, err)
 				continue

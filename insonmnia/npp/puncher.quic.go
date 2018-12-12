@@ -22,7 +22,7 @@ const (
 
 type natPuncherQUICBase struct {
 	protocol              string
-	rendezvousClient      *rendezvousClient
+	rendezvousClient      *rendezvousClientQUIC
 	tlsConfig             *tls.Config
 	listener              *chanListener
 	passiveConnectionTxRx chan connResult
@@ -30,7 +30,7 @@ type natPuncherQUICBase struct {
 }
 
 // todo: docs
-func newNATPuncherQUICBase(rendezvousClient *rendezvousClient, tlsConfig *tls.Config, protocol string, log *zap.SugaredLogger) (*natPuncherQUICBase, error) {
+func newNATPuncherQUICBase(rendezvousClient *rendezvousClientQUIC, tlsConfig *tls.Config, protocol string, log *zap.SugaredLogger) (*natPuncherQUICBase, error) {
 	// TODO: Le soutien.
 	//  Since we have default "tcp" protocol for TCP punching it is
 	//  meaningless for QUIC. Moreover now we treat this parameter as
@@ -41,7 +41,7 @@ func newNATPuncherQUICBase(rendezvousClient *rendezvousClient, tlsConfig *tls.Co
 
 	protocol = fmt.Sprintf("%s+%s", transportProtocol, protocol)
 
-	listener, err := quic.Listen(rendezvousClient.UDPConn, tlsConfig, xnet.DefaultQUICConfig())
+	listener, err := quic.Listen(rendezvousClient.PacketConn(), tlsConfig, xnet.DefaultQUICConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +70,7 @@ func (m *natPuncherQUICBase) punchAddr(ctx context.Context, addr *sonm.Addr) (ne
 		return nil, err
 	}
 
-	udpConn := m.rendezvousClient.UDPConn
+	udpConn := m.rendezvousClient.PacketConn()
 
 	cfg := xnet.DefaultQUICConfig()
 
@@ -86,7 +86,7 @@ type natPuncherClientQUIC struct {
 	*natPuncherQUICBase
 }
 
-func newNATPuncherClientQUIC(rendezvousClient *rendezvousClient, tlsConfig *tls.Config, protocol string, log *zap.SugaredLogger) (*natPuncherClientQUIC, error) {
+func newNATPuncherClientQUIC(rendezvousClient *rendezvousClientQUIC, tlsConfig *tls.Config, protocol string, log *zap.SugaredLogger) (*natPuncherClientQUIC, error) {
 	base, err := newNATPuncherQUICBase(rendezvousClient, tlsConfig, protocol, log)
 	if err != nil {
 		return nil, err
@@ -252,7 +252,7 @@ type natPuncherServerQUIC struct {
 	cancelFunc           context.CancelFunc
 }
 
-func newNATPuncherServerQUIC(rendezvousClient *rendezvousClient, tlsConfig *tls.Config, protocol string, log *zap.SugaredLogger) (*natPuncherServerQUIC, error) {
+func newNATPuncherServerQUIC(rendezvousClient *rendezvousClientQUIC, tlsConfig *tls.Config, protocol string, log *zap.SugaredLogger) (*natPuncherServerQUIC, error) {
 	base, err := newNATPuncherQUICBase(rendezvousClient, tlsConfig, protocol, log)
 	if err != nil {
 		return nil, err

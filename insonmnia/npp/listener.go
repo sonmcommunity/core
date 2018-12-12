@@ -1,5 +1,4 @@
 // This package is responsible for server-side of NAT Punching Protocol.
-// TODO: Check for reuseport available. If not - do not try to punch the NAT.
 
 package npp
 
